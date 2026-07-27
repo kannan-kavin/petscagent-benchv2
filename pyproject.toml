@@ -16,6 +16,8 @@ dependencies = [
     "petsc-mcp-servers-clients @ git+https://gitlab.com/petsc/petsc_mcp_servers.git@add-claude-code-generator-server",
     "loguru>=0.7.3",
     "numpy>=2.4.1",
+    "faiss-cpu>=1.8.0",
+    "sentence-transformers>=3.0.0",
 ]
 [build-system]
 requires = ["hatchling"]
