@@ -529,29 +529,8 @@ class PetscAgentV2Executor(AgentExecutor):
         # Per-context plan state: {context_id: {"plan": dict, "kept": list, "dropped": list, "revised": bool}}.
         self.ctx_id_to_plan: Dict[str, Dict[str, Any]] = {}
 
-    def _stream_completion(self, **completion_kwargs):
-        """Call litellm.completion with stream=True and reassemble chunks into
-        a standard ModelResponse. Required by the ANL Argo proxy, which rejects
-        non-streaming calls that may exceed 10 min (observed 2026-07-13).
-        The returned object exposes the same `.choices[0].message.content`
-        accessor as a non-streaming call, so callers are unchanged.
-        """
-        completion_kwargs['stream'] = True
-        chunks = list(completion(**completion_kwargs))
-        return litellm.stream_chunk_builder(
-            chunks, messages=completion_kwargs.get('messages')
-        )
-
-    def _llm_json_call(self, messages: list, response_format, max_retries: int = 3) -> Dict[str, Any]:
-        """LLM call that returns a JSON-decoded dict. Shared by plan/judge paths.
-
-        Retries on empty content or JSON parse failure (max_retries times) — the
-        Argo proxy intermittently returns empty content under rapid concurrent
-        calls (observed when the multi-plan path fires 3 plan calls back-to-back
-        for the first problem of a run). Empty content is the failure mode here,
-        not a model error; retrying with identical inputs almost always succeeds.
-        Backs off ~1s, 2s, 4s between attempts to let the proxy recover.
-        """
+    def _llm_json_call(self, messages: list, response_format) -> Dict[str, Any]:
+        """LLM call that returns a JSON-decoded dict. Shared by plan/judge paths."""
         completion_kwargs: Dict[str, Any] = {
             'messages': messages,
             'model': self.model,
@@ -565,29 +544,14 @@ class PetscAgentV2Executor(AgentExecutor):
             if self.api_base_url.startswith('https://api.asksage.anl.gov'):
                 litellm.ssl_verify = os.environ["ASKSAGE_SSL_CERT_FILE"]
                 completion_kwargs['api_key'] = os.environ["ASKSAGE_API_KEY"]
-        last_err: Exception | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                response = self._stream_completion(**completion_kwargs)
-                content = response.choices[0].message.content
-                if not isinstance(content, str):
-                    raise TypeError(f"Expected string content from LLM, got {type(content)}")
-                if not content.strip():
-                    raise ValueError("empty content from LLM")
-                if content.startswith("```"):
-                    content = content.split("```", 2)[1]
-                    content = content.lstrip("json").strip()
-                return json.loads(content)
-            except (json.JSONDecodeError, ValueError, TypeError) as e:
-                last_err = e
-                if attempt < max_retries:
-                    backoff = 2 ** attempt
-                    print(f"@@@ Purple agent v2: _llm_json_call retry {attempt+1}/{max_retries} after: {e} (sleep {backoff}s)")
-                    time.sleep(backoff)
-                    continue
-                raise
-        # Unreachable, but appease the type checker.
-        raise last_err if last_err else RuntimeError("_llm_json_call: unreachable")
+        response = completion(**completion_kwargs)
+        content = response.choices[0].message.content
+        if not isinstance(content, str):
+            raise TypeError(f"Expected string content from LLM, got {type(content)}")
+        if content.startswith("```"):
+            content = content.split("```", 2)[1]
+            content = content.lstrip("json").strip()
+        return json.loads(content)
 
     def _generate_plan(
         self,
@@ -633,13 +597,7 @@ class PetscAgentV2Executor(AgentExecutor):
         if self.plan_num_plans <= 1:
             return self._generate_plan(user_input, failure_history=failure_history)
         candidates: list[tuple[str, Dict[str, Any]]] = []
-        for i, (label, addendum) in enumerate(PLAN_VARIANT_PROMPTS[: self.plan_num_plans]):
-            if i > 0:
-                # Brief spacing between concurrent variant calls — the Argo proxy
-                # intermittently returns empty content when the multi-plan path
-                # fires N plan calls back-to-back for the first problem of a run.
-                # See petsc-argo-proxy-flakiness memory.
-                time.sleep(0.5)
+        for label, addendum in PLAN_VARIANT_PROMPTS[: self.plan_num_plans]:
             try:
                 p = self._generate_plan(
                     user_input,
@@ -844,7 +802,7 @@ class PetscAgentV2Executor(AgentExecutor):
             if self.api_base_url.startswith('https://api.asksage.anl.gov'):
                 litellm.ssl_verify = os.environ["ASKSAGE_SSL_CERT_FILE"]
                 completion_kwargs['api_key'] = os.environ["ASKSAGE_API_KEY"]
-        response = self._stream_completion(**completion_kwargs)
+        response = completion(**completion_kwargs)
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise TypeError(f"Expected string content from LLM, got {type(content)}")
