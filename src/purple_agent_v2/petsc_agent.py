@@ -1,18 +1,16 @@
-"""Purple Agent v2 — self-verifying PETSc code generator.
+"""Purple Agent implementation - the target code generation agent being tested.
 
-A drop-in replacement for `src.purple_agent.petsc_agent` that adds an inner
-verification loop using the same PETSc compile-run MCP tools the Green Agent
-uses. The wire protocol (A2A endpoint, AgentCard, response shape) is identical
-to the baseline so the Green Agent can grade v2 without any changes.
+This Purple Agent is responsible for generating PETSc C/C++ code from natural
+language problem descriptions. It operates as an A2A-compliant agent that:
 
-Inner loop per problem:
-  1. LLM emits {codes, nsize, cli_args} against the JSON schema contract.
-  2. Files are uploaded to the MCP server via create_file_from_string.
-  3. `make` is invoked. If it fails, the compile stderr is fed back into the
-     LLM as a "fix this" turn and we regenerate (≤ max_iters times).
-  4. On compile success, an optional smoke run via `run_executable` catches
-     immediate runtime failures the same way.
-  5. The first self-validated response is returned to Green over A2A.
+1. Receives problem descriptions via the A2A protocol
+2. Uses an LLM to generate PETSc code
+3. Returns generated code files along with CLI arguments
+4. Maintains conversation context for multi-turn interactions
+
+The agent is isolated from the evaluation logic and is the subject of testing
+by the Green Agent through the petscagent-bench framework. The Green Agent can
+grade v2 without any changes.
 """
 
 import argparse
@@ -41,12 +39,21 @@ from a2a.utils import new_agent_parts_message
 import petscmcp
 from petsc_compile_run_mcp_client import PetscCompileRunMCPClient
 
+# Optional RAG import. rag_retrieve(query) does a vector search over the
+# pre-built PETSc corpus and returns top-K chunks; rag_format(chunks) turns
+# them into a prompt-ready string. If src.petsc_rag isn't on this machine,
+# both fall back to None and downstream code skips RAG via `is not None`.
 try:
     from src.petsc_rag.retrieve import retrieve as rag_retrieve, format_for_prompt as rag_format
-except Exception as _rag_import_err:  # noqa: F841
+except Exception:
     rag_retrieve = None
     rag_format = None
 
+# Optional header-signature lookup. Given text, _hdr_extract finds PETSc
+# symbol names (KSPSolve, MatCreate, ...); _hdr_lookup returns the exact C
+# signature parsed from PETSc .h files; _hdr_format builds a prompt block;
+# _hdr_size reports index size for status logs. Prevents "wrong-signature"
+# LLM mistakes (e.g. "gmres" vs KSPGMRES) before compile ever sees them.
 try:
     from src.petsc_rag.headers import (
         extract_petsc_symbols as _hdr_extract,
@@ -54,15 +61,21 @@ try:
         size as _hdr_size,
         lookup as _hdr_lookup,
     )
-except Exception as _hdr_import_err:  # noqa: F841
+except Exception:
     _hdr_extract = None
     _hdr_format = None
     _hdr_size = None
     _hdr_lookup = None
 
+# Load .env so PETSC_DIR, LLM API keys, and MCP_SERVER_URL are available
+# via os.environ.get(...) throughout the rest of the file.
 dotenv.load_dotenv()
 
 
+# System prompt that defines the code generation contract for v2.
+# The strict JSON output rule lets downstream code json.loads the response
+# directly; the PETSc guidance blocks compress common failure modes; the
+# ITERATION rule tells the LLM how to behave on self-verify fix-it turns.
 SYSTEM_CODE_CONTRACT = (
     "You are a PETSc code-generation agent. You produce compilable, runnable PETSc C/C++/CUDA programs.\n"
     "\n"
@@ -94,10 +107,23 @@ SYSTEM_CODE_CONTRACT = (
 
 
 def load_purple_agent_v2_config(config_path: str = "config/purple_agent_v2_config.yaml") -> Dict[str, Any]:
+    """Load purple agent v2 configuration from file or use defaults.
+
+    Supports both JSON and YAML formats. Format is auto-detected by file extension.
+    The returned dict shape also documents the full v2 configuration surface —
+    any knob not present here isn't a real knob.
+
+    Args:
+        config_path: Path to the configuration file
+
+    Returns:
+        Configuration dictionary
+    """
     config_file = Path(config_path)
     if config_file.exists():
         try:
             with open(config_file, 'r') as f:
+                # Detect format by extension
                 if config_file.suffix.lower() in ['.yaml', '.yml']:
                     import yaml
                     data = yaml.safe_load(f)
@@ -109,6 +135,7 @@ def load_purple_agent_v2_config(config_path: str = "config/purple_agent_v2_confi
             print(f"@@@ Purple agent v2: failed to load config {config_path}: {e}. Using defaults.")
     else:
         print(f"@@@ Purple agent v2: config {config_path} not found, using defaults")
+    # Fall back to default configuration
     return {
         'llm': {'model': 'anthropic/claude-opus-4-5', 'api_base_url': None, 'temperature': 0.0},
         'mcp': {'server_url': os.environ.get('MCP_SERVER_URL', 'http://localhost:8080/mcp')},
@@ -129,6 +156,19 @@ def load_purple_agent_v2_config(config_path: str = "config/purple_agent_v2_confi
 
 
 def prepare_purple_agent_v2_card(url: str) -> AgentCard:
+    """Create an A2A agent card for the Purple Agent v2.
+
+    The agent card is a metadata descriptor that advertises the agent's
+    capabilities, skills, and communication modes to potential clients.
+    Wire-compatible with the baseline (v1) purple agent's card shape so
+    the Green Agent grades both variants identically.
+
+    Args:
+        url: The base URL where this agent is accessible
+
+    Returns:
+        AgentCard object describing the Purple Agent v2's capabilities
+    """
     skill = AgentSkill(
         id="petsc_code_generation_v2",
         name="PETSc Code Generation (v2, self-verifying)",
@@ -156,9 +196,12 @@ def prepare_purple_agent_v2_card(url: str) -> AgentCard:
     )
 
 
+# Regex for turning an arbitrary A2A context_id into a filesystem-safe basename.
 _SAFE_NAME_RE = re.compile(r'[^A-Za-z0-9_]+')
 
 
+# Diagnostic regexes for parsing PETSc runtime output. Each targets a specific
+# failure signature that indicates the program ran but produced garbage.
 _DIAG_DIVERGED = re.compile(r'\bDIVERGED_\w+', re.IGNORECASE)
 _DIAG_NAN_INF = re.compile(r'(?:Floating point exception|\b[+-]?(?:nan|inf)\b)', re.IGNORECASE)
 _DIAG_PETSC_ERROR = re.compile(r'\[\d+\]PETSC ERROR:')
@@ -171,6 +214,8 @@ _DIAG_PETSC_ERROR = re.compile(r'\[\d+\]PETSC ERROR:')
 # out of the default `diagnostic_flags` list so PETSc doesn't even print it.
 
 
+# Human-readable hints appended to the fix-it turn per diagnostic kind.
+# Gives the LLM a starting point beyond just the raw stderr.
 _DIAG_HINTS = {
     "divergence": (
         "This usually means the wrong solver/preconditioner for this matrix, an ill-conditioned "
@@ -202,6 +247,7 @@ def _parse_petsc_diagnostics(stdout: str, stderr: str = "") -> dict | None:
         return None
 
     lines = combined.splitlines()
+    # Highest-priority: solver explicitly diverged.
     diverged_lines = [ln for ln in lines if _DIAG_DIVERGED.search(ln)]
     if diverged_lines:
         return {
@@ -210,6 +256,7 @@ def _parse_petsc_diagnostics(stdout: str, stderr: str = "") -> dict | None:
             "output_tail": "\n".join(lines[-30:]),
         }
 
+    # Next: numerical blow-up (NaN / Inf / floating-point exception).
     nan_lines = [ln for ln in lines if _DIAG_NAN_INF.search(ln)]
     if nan_lines:
         return {
@@ -218,6 +265,7 @@ def _parse_petsc_diagnostics(stdout: str, stderr: str = "") -> dict | None:
             "output_tail": "\n".join(lines[-30:]),
         }
 
+    # Lowest-priority: PETSc printed an internal error block.
     petsc_err = _DIAG_PETSC_ERROR.findall(combined)
     if petsc_err:
         idx = combined.find("PETSC ERROR:")
@@ -256,11 +304,31 @@ def _safe_basename(context_id: str | None, fallback: str = "v2prog") -> str:
 
 
 class CodeFile(BaseModel):
+    """A single source file in the LLM's response.
+
+    Attributes:
+        filename: Filename the LLM chose (e.g. "main.c"); v2 renames the first
+            entry to a per-problem basename before uploading to the MCP server.
+        code: Raw C/C++/CUDA source as a string.
+    """
+
     filename: str
     code: str
 
 
 class ProblemResponse(BaseModel):
+    """Structured schema for the LLM's code-generation response.
+
+    Passed as `response_format` to litellm so the model is forced to produce
+    parseable JSON matching this shape. Downstream code uses these fields
+    directly without re-validating.
+
+    Attributes:
+        codes: One or more source files. First entry is the main file.
+        nsize: Number of MPI processes to launch (1 = sequential).
+        cli_args: Runtime flags passed to the compiled binary.
+    """
+
     codes: list[CodeFile]
     nsize: int
     cli_args: str
@@ -283,6 +351,9 @@ class NumericalPlan(BaseModel):
     rationale: str
 
 
+# System prompt for the plan-generation LLM call (plan-then-code feature).
+# The plan locks the implementation to a discretization + solver + API surface
+# BEFORE any C code is written, reducing mid-generation drift.
 SYSTEM_PLAN_CONTRACT = (
     "You are a PETSc Numerical Analysis specialist. Before any code is written you produce a "
     "structured plan that commits the implementer to a discretization, a solver stack, and the "
@@ -339,6 +410,8 @@ PLAN_VARIANT_PROMPTS = [
 ]
 
 
+# System prompt for the plan-judge LLM call. Given N candidate plans for the
+# same problem, scores each on a 5-criterion rubric and picks a winner.
 SYSTEM_PLAN_JUDGE = (
     "You are a PETSc Numerical Analysis review panel. You receive several candidate plans for the SAME problem "
     "and must pick the ONE plan that is most likely to produce a correct, runnable PETSc program for the user's "
@@ -363,12 +436,29 @@ SYSTEM_PLAN_JUDGE = (
 
 
 class PlanScore(BaseModel):
+    """One judge score entry for a single candidate plan.
+
+    Attributes:
+        index: 0-based position of the scored plan in the candidate list.
+        total: Rubric sum across the 5 criteria (max 50).
+        notes: Free-text justification for the score.
+    """
+
     index: int
     total: int
     notes: str
 
 
 class PlanJudgement(BaseModel):
+    """Full judge response for a multi-plan comparison.
+
+    Attributes:
+        winner_index: 0-based index of the plan the judge picked.
+        scores: Per-candidate rubric scores (may disagree with winner_index —
+            see _select_plan for the reconciliation policy).
+        rationale: 2-4 sentence explanation of the winner choice.
+    """
+
     winner_index: int
     scores: list[PlanScore]
     rationale: str
@@ -450,18 +540,45 @@ def _format_plan_for_green(plan: dict, kept: list[str], dropped: list[str]) -> s
 
 
 class PetscAgentV2Executor(AgentExecutor):
-    """A2A executor with an inner compile/run self-verification loop."""
+    """A2A executor with an inner compile/run self-verification loop.
+
+    Extends the v1 executor pattern with:
+      - Self-verification: after generation, upload+compile+smoke-run via MCP;
+        feed failures back to the LLM as fix-it turns (up to max_iters).
+      - RAG: inject retrieved PETSc tutorials into the first-turn system prompt.
+      - Header lookup: inject canonical PETSc signatures on compile-error fix-it turns.
+      - Plan-then-code: force a structured numerical plan (optionally multi-plan
+        + judge) before writing any code; revise the plan after repeated failures.
+
+    All features are config-gated; with everything off, behavior is close to v1.
+
+    Attributes:
+        model: LLM model identifier (e.g. "anthropic/claude-opus-4-5").
+        ctx_id_to_messages: Dict mapping A2A context IDs to per-problem message
+            history for multi-turn (fix-it) LLM conversations.
+        ctx_id_to_plan: Dict mapping context IDs to the locked plan state
+            (plan dict + validated/dropped API lists + revised flag).
+    """
 
     def __init__(self, config: Dict[str, Any]):
+        """Initialize the executor from a purple-agent-v2 config dict.
+
+        Args:
+            config: Config dict, typically loaded from
+                config/purple_agent_v2_config.yaml via load_purple_agent_v2_config.
+        """
         self.config = config
+        # --- LLM settings ---
         llm_cfg = config.get('llm', {})
         self.model = llm_cfg.get('model')
         self.temperature = float(llm_cfg.get('temperature', 0))
         self.api_base_url = llm_cfg.get('api_base_url')
 
+        # --- MCP compile-run server ---
         mcp_cfg = config.get('mcp', {})
         self.mcp_server_url = mcp_cfg.get('server_url') or os.environ.get('MCP_SERVER_URL', 'http://localhost:8080/mcp')
 
+        # --- Self-fix / self-verify loop knobs ---
         sf = config.get('self_fix', {})
         self.max_iters = int(sf.get('max_iters', 3))
         self.do_smoke_run = bool(sf.get('do_smoke_run', True))
@@ -470,9 +587,7 @@ class PetscAgentV2Executor(AgentExecutor):
         # Wall-clock budget for a single problem's self-verify loop, in seconds.
         # Must be strictly less than Green's A2A read timeout (currently 3000s in
         # src/util/a2a_comm.py) so Purple always returns before Green kills the
-        # request. Discovered in DarcyFlow run 12 where plan revision + proxy
-        # contention burned >3000s and Green scored a 0 on a timeout, discarding
-        # partial results. Default 2400s = 40min leaves a 10-min safety margin.
+        # request. Default 2400s = 40min leaves a 10-min safety margin.
         self.wall_clock_budget_sec = float(sf.get('wall_clock_budget_sec', 2400.0))
         # After plan revision fires, allow this many additional self-verify
         # attempts against the revised plan. Previously revision could fire on
@@ -486,15 +601,19 @@ class PetscAgentV2Executor(AgentExecutor):
             '-ts_monitor',
         ])
 
+        # --- RAG (retrieval-augmented generation) ---
         rag_cfg = config.get('rag', {})
         self.rag_enabled = bool(rag_cfg.get('enabled', False))
         self.rag_k = int(rag_cfg.get('k', 4))
         self.rag_rerank = bool(rag_cfg.get('rerank', False))
         self.rag_k_initial = int(rag_cfg.get('k_initial', 2 * self.rag_k + 4))
+        # Guard: config says enabled but the package didn't import (e.g. faiss
+        # missing). Silently disable rather than crash on first request.
         if self.rag_enabled and rag_retrieve is None:
             print("@@@ Purple agent v2: rag.enabled=true but petsc_rag import failed; disabling RAG.")
             self.rag_enabled = False
 
+        # --- Header signature lookup ---
         hdr_cfg = config.get('header_lookup', {})
         self.header_lookup_enabled = bool(hdr_cfg.get('enabled', True))
         self.header_lookup_limit = int(hdr_cfg.get('limit', 8))
@@ -502,6 +621,7 @@ class PetscAgentV2Executor(AgentExecutor):
             print("@@@ Purple agent v2: header_lookup.enabled=true but headers module import failed; disabling.")
             self.header_lookup_enabled = False
         elif self.header_lookup_enabled:
+            # Eager index-load so first-request latency isn't hit by a cold start.
             try:
                 n = _hdr_size() if _hdr_size else 0
                 print(f"@@@ Purple agent v2: header signature index loaded ({n} symbols)")
@@ -509,11 +629,13 @@ class PetscAgentV2Executor(AgentExecutor):
                 print(f"@@@ Purple agent v2: header_lookup load failed ({e}); disabling.")
                 self.header_lookup_enabled = False
 
+        # --- Plan-then-code feature ---
         plan_cfg = config.get('plan', {})
         self.plan_enabled = bool(plan_cfg.get('enabled', False))
         self.plan_allow_revision = bool(plan_cfg.get('allow_plan_revision', True))
         self.plan_emit_to_green = bool(plan_cfg.get('emit_to_green', True))
         self.plan_num_plans = int(plan_cfg.get('num_plans', 1))  # 1 = single-plan legacy; >1 = multi-plan + judge
+        # Clamp num_plans to the number of angle variants we actually have.
         if self.plan_num_plans > len(PLAN_VARIANT_PROMPTS):
             print(
                 f"@@@ Purple agent v2: plan.num_plans={self.plan_num_plans} exceeds "
@@ -525,6 +647,7 @@ class PetscAgentV2Executor(AgentExecutor):
         if self.plan_enabled and _hdr_lookup is None:
             print("@@@ Purple agent v2: plan.enabled=true but headers module unavailable; API validation will be a no-op.")
 
+        # Per-context conversation history for multi-turn (fix-it) interactions.
         self.ctx_id_to_messages: Dict[str, list] = {}
         # Per-context plan state: {context_id: {"plan": dict, "kept": list, "dropped": list, "revised": bool}}.
         self.ctx_id_to_plan: Dict[str, Dict[str, Any]] = {}
@@ -539,6 +662,7 @@ class PetscAgentV2Executor(AgentExecutor):
             'timeout': 300,
         }
         litellm.ssl_verify = False
+        # AskSage endpoints need explicit SSL cert + API key from env.
         if self.api_base_url:
             completion_kwargs['api_base'] = self.api_base_url
             if self.api_base_url.startswith('https://api.asksage.anl.gov'):
@@ -548,6 +672,7 @@ class PetscAgentV2Executor(AgentExecutor):
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise TypeError(f"Expected string content from LLM, got {type(content)}")
+        # Strip markdown fences some LLMs (e.g. Claude) add.
         if content.startswith("```"):
             content = content.split("```", 2)[1]
             content = content.lstrip("json").strip()
@@ -597,7 +722,9 @@ class PetscAgentV2Executor(AgentExecutor):
         if self.plan_num_plans <= 1:
             return self._generate_plan(user_input, failure_history=failure_history)
         candidates: list[tuple[str, Dict[str, Any]]] = []
-        for label, addendum in PLAN_VARIANT_PROMPTS[: self.plan_num_plans]:
+        for i, (label, addendum) in enumerate(PLAN_VARIANT_PROMPTS[: self.plan_num_plans]):
+            if i > 0:
+                time.sleep(0.5)
             try:
                 p = self._generate_plan(
                     user_input,
@@ -609,6 +736,7 @@ class PetscAgentV2Executor(AgentExecutor):
                 print(f"@@@ Purple agent v2: plan variant '{label}' failed ({e}); skipping")
         if not candidates:
             raise RuntimeError("all plan variants failed; cannot proceed with plan-then-code")
+        # Only one variant survived — skip the judge, no comparison to do.
         if len(candidates) == 1:
             label, plan = candidates[0]
             print(f"@@@ Purple agent v2: only 1 plan variant succeeded ('{label}'); skipping judge")
@@ -635,11 +763,9 @@ class PetscAgentV2Executor(AgentExecutor):
         absent/malformed, and to candidate 0 when even that is out of range.
 
         Motivation: `winner_index` and `scores` are two independent LLM outputs
-        from the same call and can disagree — observed in Advection multi-plan
-        run 3, where the judge picked `simplest` despite `accurate` outscoring
-        it in the rubric. That single self-inconsistency dropped Advection from
-        ~82 to ~50 and drove all of v2's residual composite variance.
+        from the same call and can disagree.
         """
+        # Build the judge's user turn: the problem + every candidate plan.
         cand_block_lines = [f"USER PROBLEM:\n{user_input}\n", "CANDIDATE PLANS:"]
         for i, (label, p) in enumerate(candidates):
             cand_block_lines.append(
@@ -663,6 +789,7 @@ class PetscAgentV2Executor(AgentExecutor):
                 winner = sorted(valid_scores, key=sort_key)[0]
                 idx = winner.index
                 raw_idx = int(raw.get("winner_index", -1))
+                # Judge disagreed with its own rubric — log and trust the rubric.
                 if raw_idx != idx:
                     print(
                         f"@@@ Purple agent v2: judge self-inconsistency — winner_index="
@@ -681,7 +808,12 @@ class PetscAgentV2Executor(AgentExecutor):
         return candidates[0][0], candidates[0][1], []
 
     def _header_hint_block(self, error_text: str) -> str:
-        """Look up canonical signatures for any PETSc symbols named in error_text."""
+        """Look up canonical signatures for any PETSc symbols named in error_text.
+
+        Called on compile-error and runtime-error fix-it turns. Returns a
+        prompt-ready block of "here's the real signature" hints, or empty
+        string if the feature is off / no symbols were found / lookup failed.
+        """
         if not self.header_lookup_enabled or not error_text:
             return ""
         try:
@@ -697,10 +829,34 @@ class PetscAgentV2Executor(AgentExecutor):
             return ""
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        """Execute a code generation request.
+
+        This method is called by the A2A framework when a message is received.
+        It processes the request through the following steps:
+
+        1. Extract user input from the request context
+        2. On first turn: build the system prompt (optionally with RAG-retrieved
+           tutorials and a locked numerical plan) and initialize conversation history
+        3. Call _generate_and_self_verify to drive the generate → compile → run
+           → fix-it loop until a passing (or last-attempt) result is returned
+        4. Assemble the A2A response (TextPart with metadata + one FilePart per
+           generated code file) and enqueue it
+
+        Args:
+            context: Request context containing user input and metadata (including
+                context_id, used for per-problem state and executable naming)
+            event_queue: Queue for sending response events back to the client
+
+        Note:
+            The method handles both success and error cases, always returning
+            a properly formatted A2A response.
+        """
         user_input = context.get_user_input()
 
+        # First turn for this context: build the initial system prompt.
         if context.context_id not in self.ctx_id_to_messages:
             system_content = SYSTEM_CODE_CONTRACT
+            # Optionally splice retrieved PETSc tutorials into the system prompt.
             if self.rag_enabled:
                 try:
                     hits = rag_retrieve(
@@ -722,6 +878,7 @@ class PetscAgentV2Executor(AgentExecutor):
                         )
                 except Exception as e:
                     print(f"@@@ Purple agent v2: RAG retrieval failed ({e}); falling back to base prompt.")
+            # Optionally generate + lock a numerical plan before any code is written.
             if self.plan_enabled:
                 try:
                     plan = self._generate_plan_set(user_input)
@@ -745,11 +902,13 @@ class PetscAgentV2Executor(AgentExecutor):
         messages = self.ctx_id_to_messages[context.context_id]
         messages.append({"role": "user", "content": user_input})
 
+        # Per-problem prefix so concurrent problems don't collide on the MCP server.
         basename = _safe_basename(context.context_id)
 
         try:
             data = await self._generate_and_self_verify(messages, basename, context.context_id, user_input)
         except Exception as e:
+            # Any hard failure escaping the self-verify loop: report to Green as an error part.
             print(f"@@@ Purple agent v2: ❌ failed: {e}")
             await event_queue.enqueue_event(
                 new_agent_parts_message(
@@ -759,6 +918,7 @@ class PetscAgentV2Executor(AgentExecutor):
             )
             return
 
+        # Build the success response: a TextPart with metadata + one FilePart per source file.
         nsize = data["nsize"]
         cli_args = data["cli_args"]
         sv_attempts = data.get("self_verify_attempts", "?")
@@ -770,6 +930,7 @@ class PetscAgentV2Executor(AgentExecutor):
             f"self_verify_attempts: {sv_attempts}\n"
             f"self_verify_status: {sv_status}\n"
         )
+        # Optionally append the plan as a labeled block for Green's LLM-judge evaluators.
         if self.plan_enabled and self.plan_emit_to_green:
             pstate = self.ctx_id_to_plan.get(context.context_id)
             if pstate is not None:
@@ -789,6 +950,7 @@ class PetscAgentV2Executor(AgentExecutor):
         )
 
     def _call_llm(self, messages: list) -> Dict[str, Any]:
+        """LLM call that returns the code-generation response as a dict."""
         completion_kwargs: Dict[str, Any] = {
             'messages': messages,
             'model': self.model,
@@ -806,6 +968,7 @@ class PetscAgentV2Executor(AgentExecutor):
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise TypeError(f"Expected string content from LLM, got {type(content)}")
+        # Strip markdown fences some LLMs add.
         if content.startswith("```"):
             content = content.split("```", 2)[1]
             content = content.lstrip("json").strip()
@@ -918,6 +1081,7 @@ class PetscAgentV2Executor(AgentExecutor):
                                 "plan": new_plan, "kept": kept, "dropped": dropped, "revised": True,
                             }
                             plan_block = _format_plan_for_prompt(new_plan, sig_block, dropped)
+                            # Rewrite the system prompt in-place to swap in the revised plan.
                             if messages and messages[0].get("role") == "system":
                                 base_sys = messages[0]["content"].split("\n\nLOCKED NUMERICAL PLAN")[0]
                                 messages[0]["content"] = f"{base_sys}\n\n{plan_block}"
@@ -930,6 +1094,7 @@ class PetscAgentV2Executor(AgentExecutor):
                             })
                         except Exception as e:
                             print(f"@@@ Purple agent v2: plan revision failed ({e}); continuing with prior plan.")
+                # Generate this attempt's code.
                 try:
                     data = self._call_llm(messages)
                 except (json.JSONDecodeError, ValueError, TypeError) as e:
@@ -980,6 +1145,7 @@ class PetscAgentV2Executor(AgentExecutor):
                 if not compile_ok:
                     last_failure_kind = "compilation"
                     last_failure_excerpt = compile_stderr
+                    # Enrich the fix-it turn with canonical signatures for any PETSc symbols in the error.
                     hint = self._header_hint_block(compile_stderr)
                     messages.append({
                         "role": "user",
@@ -998,6 +1164,7 @@ class PetscAgentV2Executor(AgentExecutor):
                     data["self_verify_status"] = "compile_ok_no_smoke"
                     return data
 
+                # Inject diagnostic flags so we can parse solver output for silent failures.
                 user_args = str(data.get("cli_args", "") or "")
                 if self.check_diagnostics and self.diagnostic_flags:
                     run_args = (user_args + " " + " ".join(self.diagnostic_flags)).strip()
@@ -1011,6 +1178,7 @@ class PetscAgentV2Executor(AgentExecutor):
                         args=run_args,
                         timeout=self.smoke_run_timeout_sec,
                     )
+                    # Clean exit — still check diagnostic output for silent failures.
                     if self.check_diagnostics:
                         diag = _parse_petsc_diagnostics(run_stdout or "", "")
                         if diag is not None:
@@ -1029,6 +1197,7 @@ class PetscAgentV2Executor(AgentExecutor):
                     data["self_verify_status"] = "passed"
                     return data
                 except petscmcp.MCPDynamicClientReturnCode as e:
+                    # Non-zero exit from the binary itself. Try diagnostic parse first, fall back to raw stderr.
                     run_stderr = (e.stderr or e.stdout or "")[-3500:]
                     diag = (
                         _parse_petsc_diagnostics(e.stdout or "", e.stderr or "")
@@ -1081,6 +1250,8 @@ class PetscAgentV2Executor(AgentExecutor):
                     })
                     continue
         finally:
+            # Best-effort MCP client teardown; ignore errors here so a failed close
+            # doesn't mask the real failure that caused us to exit the loop.
             try:
                 await mcp_ctx.__aexit__(None, None, None)
             except Exception:
@@ -1094,10 +1265,9 @@ class PetscAgentV2Executor(AgentExecutor):
             f"in {elapsed:.0f}s (last failure: {last_failure_kind})"
         )
         # Only make the last-ditch LLM call if we have wall-clock room AND no
-        # parseable data from any prior attempt. This closes a hang path
-        # (DarcyFlow run 12) where the loop exited with last_data=None near
-        # Green's timeout and the extra LLM call under proxy contention pushed
-        # the round-trip over the A2A read limit, giving Green a hard-zero.
+        # parseable data from any prior attempt. This closes a hang path where
+        # the loop exits with last_data=None near Green's timeout and the extra
+        # LLM call pushes the round-trip over the A2A read limit.
         if last_data is None:
             remaining = self.wall_clock_budget_sec - elapsed
             if remaining > 60.0:
@@ -1127,6 +1297,7 @@ class PetscAgentV2Executor(AgentExecutor):
         try:
             for idx, entry in enumerate(codes):
                 fname = entry.get("filename") or f"{basename}.c"
+                # First file is the main file — rename to per-problem basename.
                 if idx == 0:
                     ext = fname.rsplit('.', 1)[-1] if '.' in fname else 'c'
                     if ext == 'cu':
@@ -1146,6 +1317,19 @@ class PetscAgentV2Executor(AgentExecutor):
             return (basename, f"MCP error during file upload: {e}")
 
     async def cancel(self, context, event_queue) -> None:
+        """Cancel a running task (not implemented).
+
+        Required by the AgentExecutor interface but not implemented — v2's
+        self-verify loop is atomic per problem and Green's outer timeout is
+        the effective cancellation mechanism.
+
+        Args:
+            context: Request context
+            event_queue: Event queue for sending cancellation acknowledgment
+
+        Raises:
+            NotImplementedError: Always, as cancellation is not supported.
+        """
         raise NotImplementedError
 
 
@@ -1158,10 +1342,22 @@ def start_purple_agent_v2(
     mcp_server_url: str | None = None,
     config_path: str = "config/purple_agent_v2_config.yaml",
 ):
-    """Start the Purple Agent v2 A2A HTTP service."""
+    """Start the Purple Agent v2 A2A HTTP service.
+
+    Args:
+        host: Interface to bind the HTTP server to.
+        port: Port to bind the HTTP server to.
+        card_url: Optional explicit URL used to build/advertise the agent card.
+            If not provided, a URL is constructed from `host` and `port`.
+        agent_llm: Optional LLM model name (overrides config file value).
+        api_base_url: Optional LLM API base URL (overrides config file value).
+        mcp_server_url: Optional MCP compile-run server URL (overrides config file value).
+        config_path: Path to the Purple Agent v2 config file (YAML/JSON).
+    """
     logger.info("Starting purple agent v2...")
     card = prepare_purple_agent_v2_card(card_url or f"http://{host}:{port}")
 
+    # Load config and apply CLI overrides.
     config = load_purple_agent_v2_config(config_path)
     if agent_llm:
         config.setdefault("llm", {})["model"] = agent_llm
