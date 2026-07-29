@@ -11,6 +11,12 @@ into the fix-it turn.
 This is *not* problem-specific: any PETSc API call the agent gets wrong can be
 corrected by the same loop, because the index covers the entire installed
 public header surface.
+
+Contract with the outer agent:
+  extract_petsc_symbols(compiler_text) -> [symbol names in error]
+  lookup(name)                          -> (canonical signature, header file)
+  format_signature_block(names)         -> string ready to splice into a prompt
+  size()                                -> number of symbols indexed (status log)
 """
 
 from __future__ import annotations
@@ -21,15 +27,29 @@ from pathlib import Path
 from typing import Iterable
 
 
+# Matches lines of the form
+#   PETSC_EXTERN PetscErrorCode Foo(int a, double b);
+# across the entire public header surface. This form covers the vast majority
+# of PETSc's user-facing API; things declared as macros, inlines, or with
+# non-PetscErrorCode return types are intentionally skipped — they rarely
+# cause the arity/type mismatches this index is meant to correct.
 _SIG_RE = re.compile(
     r"^PETSC_EXTERN\s+PetscErrorCode\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^;]*)\)\s*;",
     re.MULTILINE,
 )
 
+# Module-level lazy cache. `loaded=True` after the first _load() call; the
+# built dict lives under `index`. Keeping state in a plain dict (instead of
+# @lru_cache or a class) lets tests reset it by clearing the dict.
 _state: dict[str, object] = {"loaded": False}
 
 
 def _petsc_include_dirs() -> list[Path]:
+    """Return the header roots we should walk, or [] if PETSC_DIR isn't set.
+
+    Currently a single directory (`$PETSC_DIR/include`) but returned as a list
+    so the walker can trivially extend to per-arch headers or externals later.
+    """
     root = os.environ.get("PETSC_DIR")
     if not root:
         return []
@@ -40,6 +60,7 @@ def _petsc_include_dirs() -> list[Path]:
 
 
 def _walk_headers(roots: Iterable[Path]) -> list[Path]:
+    """Return every .h under each root, skipping Fortran-shim headers."""
     out: list[Path] = []
     for root in roots:
         for p in root.rglob("*.h"):
@@ -52,7 +73,12 @@ def _walk_headers(roots: Iterable[Path]) -> list[Path]:
 
 
 def _parse_header(path: Path) -> list[tuple[str, str, str]]:
-    """Return [(name, full_signature_line, header_basename)] for one file."""
+    """Return [(name, full_signature_line, header_basename)] for one file.
+
+    Reads the header, applies _SIG_RE, and normalizes each match into a
+    single canonical `PetscErrorCode Name(args);` line — even if the original
+    source split it across many lines with weird whitespace.
+    """
     try:
         text = path.read_text(errors="ignore")
     except Exception:
@@ -67,6 +93,12 @@ def _parse_header(path: Path) -> list[tuple[str, str, str]]:
 
 
 def _load() -> None:
+    """Populate `_state['index']` on first call; no-op afterwards.
+
+    Called by every public entry point so callers don't need to remember
+    initialization. If PETSC_DIR isn't set the index is empty and all lookups
+    return None — the outer agent's fallback path handles that cleanly.
+    """
     if _state.get("loaded"):
         return
     index: dict[str, tuple[str, str]] = {}
@@ -89,12 +121,16 @@ def lookup(name: str) -> tuple[str, str] | None:
 
 
 def size() -> int:
+    """Number of symbols in the index (for @@@ status logs in the agent)."""
     _load()
     idx = _state.get("index") or {}
     return len(idx)  # type: ignore[arg-type]
 
 
 # Tokens that look like PETSc symbols but aren't worth chasing.
+# These are constants, opaque handle typedefs, and macros — never functions we
+# can look up a signature for. Filtering them here avoids polluting the
+# fix-it-turn prompt with useless "no signature found for KSP" lines.
 _SKIP_TOKENS = {
     "PETSC_NULL", "PETSC_TRUE", "PETSC_FALSE", "PETSC_COMM_WORLD",
     "PETSC_COMM_SELF", "PETSC_DECIDE", "PETSC_DETERMINE", "PETSC_DEFAULT",
@@ -108,6 +144,10 @@ _SKIP_TOKENS = {
     "PetscDS", "PetscFV", "PetscQuadrature", "PetscWeakForm",
 }
 
+# Loose PETSc-symbol shape: starts uppercase, then any alnum/underscore,
+# minimum length 4 to avoid matching stray "DM" / "TS" fragments that the
+# skip-set already catches but the ordering matters. The real filter is
+# membership in the header index — this regex is just the coarse first pass.
 _SYMBOL_RE = re.compile(r"\b([A-Z][A-Za-z][A-Za-z0-9_]{2,})\b")
 
 
@@ -117,6 +157,10 @@ def extract_petsc_symbols(text: str, limit: int = 8) -> list[str]:
     Looks for tokens matching ^[A-Z][A-Za-z]\\w{2,}$ that ALSO exist in the
     header index. Anything that doesn't appear in the index is dropped — so
     user-defined identifiers, MPI calls, etc. don't pollute the result.
+
+    Preserves first-seen order (compiler errors typically name the offending
+    symbol before its callees) and caps at `limit` to keep the fix-it turn
+    from ballooning if the error spans many lines.
     """
     _load()
     idx = _state.get("index") or {}
@@ -135,7 +179,14 @@ def extract_petsc_symbols(text: str, limit: int = 8) -> list[str]:
 
 
 def format_signature_block(names: list[str]) -> str:
-    """Render a fix-it-turn block of canonical signatures for the given names."""
+    """Render a fix-it-turn block of canonical signatures for the given names.
+
+    Returns "" (falsy) if none of the names have a lookup hit, so the caller
+    can `if block: prompt += block` without an explicit length check. The
+    trailing "Match argument count and types EXACTLY" line is deliberately
+    imperative — softer wording ("please try to match") empirically got the
+    LLM to leave calls unchanged.
+    """
     if not names:
         return ""
     lines = ["Real PETSc signatures (from installed headers) for symbols in the error:"]
