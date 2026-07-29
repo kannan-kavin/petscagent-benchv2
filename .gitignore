@@ -54,8 +54,7 @@ main-*.stderr
 # Backup files from A/B scripts crashing
 config/*.bak.*
 
-# RAG index — regenerable, large binary
-src/petsc_rag/index/
+# Stale baseline RAG index (byte-identical to index/, not referenced by any code)
 src/petsc_rag/index.baseline/
 
 # Purple agent v1 cache
